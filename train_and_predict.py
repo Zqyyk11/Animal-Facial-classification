@@ -1,61 +1,64 @@
 """
-Pet facial-expression classifier using a 5-fold stratified ensemble.
+Pet face emotions: predict Angry, Happy, or Sad from a photo.
 
-Predicts three labels from face images: `Angry`, `Happy`, `Sad`.
+What this program does (big picture):
+  1. Load all training and test pictures into memory once.
+  2. Split training data into 5 parts (folds). Each part takes a turn being the
+     "quiz set" while the other 4 parts are used to learn. Class counts stay
+     balanced in each fold (stratified).
+  3. For each fold, train a neural network: a frozen EfficientNet (pre-trained
+     on ImageNet) + a small "head" that learns our 3 classes.
+  4. For each test image, average predictions from 4 slightly different views
+     (original, mirror, brighter, darker), then average across the 5 folds.
+  5. Save labels to submission.csv for Kaggle.
 
-Pipeline:
-    1. Load and resize all train/test images once (`preload_images`).
-    2. For each fold: train EfficientNetB2 with a frozen backbone and a small
-       MLP head; stop early when `val_loss` plateaus (`EarlyStopping`).
-    3. For each fold: run test-time augmentation (TTA) on the test set and
-       average softmax probabilities.
-    4. Average probabilities across folds, argmax to labels, write
-       `submission.csv` (columns `id`, `label`).
-
-Techniques: ImageNet-pretrained EfficientNetB2, in-model train augmentation,
-AdamW + label smoothing (sparse labels), `ReduceLROnPlateau`,
-optional mixed precision (`USE_MIXED_PRECISION`).
-
-Run from project root: `python train_and_predict.py` or `python3 ...`.
+Run from the project folder:  python3 train_and_predict.py
 """
 
 import os
+
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.model_selection import StratifiedKFold
 from tensorflow import keras
+
+# Keras layers (short name so the model code reads like a recipe)
 layers = keras.layers
 
-# --- Paths (run from project root) ---
+# ---------------------------------------------------------------------------
+# Folders and files (paths are relative to where you run the script)
+# ---------------------------------------------------------------------------
 TRAIN_DIR = "train/train"
 TEST_DIR = "test/test"
 SAMPLE_SUBMISSION_PATH = "sample_submission.csv"
 SUBMISSION_PATH = "submission.csv"
 
-# Tunable training / IO settings (reduce IMG_SIZE or BATCH_SIZE if OOM or OS kill).
-IMG_SIZE = (260, 260)
-BATCH_SIZE = 16
-SEED = 44
-N_FOLDS = 5
+# ---------------------------------------------------------------------------
+# Settings you can change (if the computer runs out of memory, lower BATCH_SIZE
+# or the image height/width in IMG_SIZE)
+# ---------------------------------------------------------------------------
+IMG_SIZE = (260, 260)  # every image is resized to this width x height
+BATCH_SIZE = 16  # how many images the model sees at once during training
+SEED = 44  # random seed so splits and training are repeatable
+N_FOLDS = 5  # how many models we train, then we average their answers
 
-# Upper bound on epochs per fold; EarlyStopping usually ends sooner.
-EPOCHS = 40
+EPOCHS = 40  # max training rounds per fold (often stops earlier automatically)
 
-# Slight smoothing helps with subjective/ambiguous labels, but not too much.
+# Label smoothing: don't force the model to be 100% sure on every example;
+# helps when some labels might be a bit wrong or fuzzy.
 LABEL_SMOOTHING = 0.03
 
+# Faster math on many GPUs (safe to leave True; if it fails, we fall back)
 USE_MIXED_PRECISION = True
+
+# Test-time augmentation: multiply pixel brightness (must use float images, not uint8)
+TTA_BRIGHTER = 1.07
+TTA_DARKER = 0.93
 
 
 def configure_mixed_precision():
-    """
-    Enable TensorFlow mixed precision.
-
-    Mixed precision can speed up training and reduce memory usage on supported
-    GPUs. If mixed precision cannot be enabled, the script continues normally
-    in float32 mode.
-    """
+    """Turn on float16 training where supported (faster, less VRAM)."""
     if not USE_MIXED_PRECISION:
         return
     try:
@@ -67,10 +70,9 @@ def configure_mixed_precision():
 
 def build_augmentation():
     """
-    Build the train-time augmentation pipeline.
-
-    The augmentation layers live inside the model so they are automatically
-    disabled during inference when the model is called with `training=False`.
+    Random image tweaks used ONLY while training (flip, rotate, zoom, etc.).
+    They sit inside the model so when we call the model for testing, we set
+    training=False and these random layers do nothing.
     """
     return keras.Sequential(
         [
@@ -87,29 +89,21 @@ def build_augmentation():
 
 def build_model(num_classes: int):
     """
-    Build the EfficientNetB2-based classifier model.
-
-    Model structure:
-    - EfficientNetB2 backbone (frozen by default).
-    - Global average pooling.
-    - A small MLP head with BatchNorm + Dropout regularization.
-
-    Notes:
-    - `efficientnet.preprocess_input` is applied after augmentation.
-    - The final softmax is forced to float32 for numeric stability under mixed
-      precision.
+    Build the network:
+      photo -> augment (train only) -> EfficientNet sizing -> EfficientNetB2 (frozen)
+      -> pool -> two small dense layers -> 3-class softmax.
     """
-    base = keras.applications.EfficientNetB2(
+    backbone = keras.applications.EfficientNetB2(
         weights="imagenet",
         include_top=False,
         input_shape=(*IMG_SIZE, 3),
     )
-    base.trainable = False
+    backbone.trainable = False  # we only train the "head" below
 
     inputs = keras.Input(shape=(*IMG_SIZE, 3))
     x = build_augmentation()(inputs)
     x = keras.applications.efficientnet.preprocess_input(x)
-    x = base(x)
+    x = backbone(x)
 
     x = layers.GlobalAveragePooling2D()(x)
     x = layers.Dense(256, activation="relu")(x)
@@ -118,38 +112,40 @@ def build_model(num_classes: int):
     x = layers.Dense(128, activation="relu")(x)
     x = layers.Dropout(0.25)(x)
 
-    # Ensure numeric dtype stays float32 for stability/softmax under mixed precision.
+    # float32 here keeps softmax stable when the rest uses float16
     outputs = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
     return keras.Model(inputs, outputs)
 
 
 def make_sparse_label_smoothing_loss(num_classes: int, smoothing: float):
     """
-    Create label smoothing loss for sparse integer labels.
-
-    This script implements smoothing manually to stay compatible with older
-    Keras/TensorFlow versions that may not support `label_smoothing` directly
-    for sparse label losses.
+    Loss function with "label smoothing": instead of target = [1,0,0] for class 0,
+    we use slightly softer targets so the model is not pushed to overconfidence.
+    (Written by hand so older Keras versions still work.)
     """
 
     def loss(y_true, y_pred):
+        # True labels come in as integers 0, 1, 2; turn them into one-hot vectors
         y = tf.cast(tf.reshape(y_true, [-1]), tf.int32)
         one_hot = tf.one_hot(y, depth=num_classes, dtype=tf.float32)
         k = tf.cast(num_classes, tf.float32)
         s = tf.cast(smoothing, tf.float32)
-        targets = one_hot * (1.0 - s) + (1.0 - one_hot) * (s / tf.maximum(k - 1.0, 1.0))
-        return tf.reduce_mean(keras.losses.categorical_crossentropy(targets, y_pred))
+        # Spread a little probability mass onto the wrong classes
+        smoothed = one_hot * (1.0 - s) + (1.0 - one_hot) * (
+            s / tf.maximum(k - 1.0, 1.0)
+        )
+        return tf.reduce_mean(
+            keras.losses.categorical_crossentropy(smoothed, y_pred)
+        )
 
     return loss
 
 
 def make_callbacks(patience_es: int):
     """
-    Create callbacks used during training.
-
-    Includes:
-    - ReduceLROnPlateau: lowers the learning rate when `val_loss` stops improving.
-    - EarlyStopping: stops training early and restores the best weights.
+    Two helpers during training:
+      - If validation loss stops improving, shrink the learning rate.
+      - If it still doesn't improve for many epochs, stop and reload the best weights.
     """
     return [
         keras.callbacks.ReduceLROnPlateau(
@@ -170,122 +166,83 @@ def make_callbacks(patience_es: int):
 
 def collect_paths_and_labels():
     """
-    Collect training image paths and integer labels.
-
-    Class index ordering is alphabetical by folder name inside `TRAIN_DIR`,
-    ensuring consistent mapping between class names and model output indices.
+    Walk train/train/<ClassName>/ and collect every image path + its class index.
+    Folder names are sorted alphabetically, so indices are always:
+      Angry=0, Happy=1, Sad=2 (for default folder names).
     """
     class_names = sorted(
         d for d in os.listdir(TRAIN_DIR) if os.path.isdir(os.path.join(TRAIN_DIR, d))
     )
     paths, labels = [], []
-    for ci, name in enumerate(class_names):
+    for class_index, name in enumerate(class_names):
         folder = os.path.join(TRAIN_DIR, name)
-        for f in sorted(os.listdir(folder)):
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif")):
-                paths.append(os.path.join(folder, f))
-                labels.append(ci)
+        for filename in sorted(os.listdir(folder)):
+            if filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif")):
+                paths.append(os.path.join(folder, filename))
+                labels.append(class_index)
     return class_names, np.array(paths), np.array(labels, dtype=np.int64)
 
 
 def preload_images(paths):
-    """
-    Load and resize all images to `IMG_SIZE` once.
-
-    Preloading avoids decoding from disk on every cross-validation fold.
-
-    Args:
-        paths: Iterable of filesystem paths to image files.
-
-    Returns:
-        `uint8` array of shape `(N, H, W, 3)` with pixels in ~[0, 255].
-    """
-    imgs = []
-    for p in paths:
-        img = keras.utils.load_img(p, target_size=IMG_SIZE)
-        arr = keras.utils.img_to_array(img).astype(np.uint8)  # 0..255
-        imgs.append(arr)
-    return np.stack(imgs)
+    """Load every image from disk once and resize to IMG_SIZE. Returns uint8 array."""
+    stacked = []
+    for path in paths:
+        img = keras.utils.load_img(path, target_size=IMG_SIZE)
+        arr = keras.utils.img_to_array(img).astype(np.uint8)
+        stacked.append(arr)
+    return np.stack(stacked)
 
 
 def make_tf_dataset_from_arrays(images_arr_uint8, labels_arr, shuffle, seed):
-    """
-    Create a `tf.data.Dataset` from preloaded numpy arrays.
-
-    Args:
-        images_arr_uint8: uint8 images in range ~[0, 255].
-        labels_arr: integer labels.
-        shuffle: whether to shuffle the dataset.
-        seed: random seed for shuffling.
-
-    Returns:
-        A dataset that yields `(float32_images, int32_labels)` batched by `BATCH_SIZE`.
-    """
-    images_arr_uint8 = tf.convert_to_tensor(images_arr_uint8)
-    labels_arr = tf.convert_to_tensor(labels_arr)
-    ds = tf.data.Dataset.from_tensor_slices((images_arr_uint8, labels_arr))
+    """Wrap numpy arrays in a TensorFlow dataset: shuffle, cast, batch, prefetch."""
+    images_tensor = tf.convert_to_tensor(images_arr_uint8)
+    labels_tensor = tf.convert_to_tensor(labels_arr)
+    ds = tf.data.Dataset.from_tensor_slices((images_tensor, labels_tensor))
     if shuffle:
-        ds = ds.shuffle(buffer_size=len(images_arr_uint8), seed=seed)
+        ds = ds.shuffle(buffer_size=len(images_tensor), seed=seed)
 
-    def cast_fn(x, y):
-        return tf.cast(x, tf.float32), tf.cast(y, tf.int32)
+    def to_float_images_and_int_labels(image, label):
+        return tf.cast(image, tf.float32), tf.cast(label, tf.int32)
 
-    ds = ds.map(cast_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(to_float_images_and_int_labels, num_parallel_calls=tf.data.AUTOTUNE)
     ds = ds.batch(BATCH_SIZE).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
 def tta_predict_probs(model, images_uint8):
     """
-    Predict class probabilities using test-time augmentation (TTA).
-
-    For each image, creates multiple fixed variants and averages the softmax
-    probabilities to reduce sensitivity to:
-    - horizontal mirroring
-    - simple brightness changes
-
-    Args:
-        model: trained Keras model.
-        images_uint8: input images as uint8 arrays.
-
-    Returns:
-        NumPy array of shape `(N, num_classes)` with averaged softmax probs.
+    For each test image, run the model on 4 versions and average the probability
+    vectors. Then we average those across folds in main().
     """
-    # Important: convert to float32 BEFORE brightness scaling, otherwise
-    # expressions like `images * 1.07` crash because `images` is uint8.
+    # uint8 * 1.07 would error in TensorFlow; use float32 first
     images = tf.cast(tf.convert_to_tensor(images_uint8), tf.float32)
-    variants = []
-    variants.append(images)  # original
-    variants.append(tf.reverse(images, axis=[2]))  # horizontal flip (width axis=2)
-    variants.append(tf.clip_by_value(images * 1.07, 0.0, 255.0))  # brighter
-    variants.append(tf.clip_by_value(images * 0.93, 0.0, 255.0))  # darker
 
-    accum = None
-    for v in variants:
-        p = model(v, training=False)
-        if hasattr(p, "numpy"):
-            p = p.numpy()
-        accum = p if accum is None else accum + p
-    return accum / float(len(variants))
+    version_0_original = images
+    version_1_mirrored = tf.reverse(images, axis=[2])  # flip left-right
+    version_2_brighter = tf.clip_by_value(
+        images * TTA_BRIGHTER, 0.0, 255.0
+    )
+    version_3_darker = tf.clip_by_value(images * TTA_DARKER, 0.0, 255.0)
+
+    versions = [
+        version_0_original,
+        version_1_mirrored,
+        version_2_brighter,
+        version_3_darker,
+    ]
+
+    total_probs = None
+    for version in versions:
+        probs = model(version, training=False)
+        if hasattr(probs, "numpy"):
+            probs = probs.numpy()
+        total_probs = probs if total_probs is None else total_probs + probs
+
+    return total_probs / float(len(versions))
 
 
 def train_one_fold(fold_idx, x_all_uint8, y_all, train_idx, val_idx, num_classes):
-    """
-    Train one fold: frozen EfficientNetB2 + trainable classification head.
-
-    Uses `AdamW`, label smoothing, `ReduceLROnPlateau`, and `EarlyStopping`
-    (`restore_best_weights=True`). Fold RNG is offset from `SEED` for diversity.
-
-    Args:
-        fold_idx: Zero-based fold index (used for RNG offsets).
-        x_all_uint8: Full training images `(N, H, W, 3)` uint8.
-        y_all: Integer labels `(N,)`.
-        train_idx, val_idx: Indices for this split.
-        num_classes: Number of classes (3).
-
-    Returns:
-        Fitted `keras.Model` for this fold.
-    """
+    """Train on train_idx, validate on val_idx; return the model for this fold."""
     keras.backend.clear_session()
     tf.keras.utils.set_random_seed(SEED + fold_idx * 17)
 
@@ -301,15 +258,15 @@ def train_one_fold(fold_idx, x_all_uint8, y_all, train_idx, val_idx, num_classes
         x_val, y_val, shuffle=False, seed=SEED + fold_idx * 3
     )
 
-    train_loss = make_sparse_label_smoothing_loss(num_classes, LABEL_SMOOTHING)
+    loss_fn = make_sparse_label_smoothing_loss(num_classes, LABEL_SMOOTHING)
     model = build_model(num_classes)
 
-    base_lr = 1e-3
+    learning_rate = 1e-3
     model.compile(
         optimizer=keras.optimizers.AdamW(
-            learning_rate=base_lr, weight_decay=1e-4, clipnorm=1.0
+            learning_rate=learning_rate, weight_decay=1e-4, clipnorm=1.0
         ),
-        loss=train_loss,
+        loss=loss_fn,
         metrics=["accuracy"],
     )
 
@@ -328,12 +285,6 @@ def train_one_fold(fold_idx, x_all_uint8, y_all, train_idx, val_idx, num_classes
 
 
 def main():
-    """
-    Run `N_FOLDS` stratified CV, ensemble TTA test probabilities, save submission.
-
-    Reads `sample_submission.csv` for test `id` order and paths under
-    `TEST_DIR`. Writes `SUBMISSION_PATH` (default `submission.csv`).
-    """
     configure_mixed_precision()
     tf.keras.utils.set_random_seed(SEED)
 
@@ -342,27 +293,26 @@ def main():
     n_samples = len(paths)
     print(f"Classes: {class_names} | Total images: {n_samples}")
 
-    # Preload train images once for speed.
     print("Preloading train images (once)...")
     x_all_uint8 = preload_images(paths)
 
-    # Load test image ids in submission order.
     submission = pd.read_csv(SAMPLE_SUBMISSION_PATH)
-    ids = submission["id"].tolist()
+    test_ids = submission["id"].tolist()
 
     print("Preloading test images (once)...")
-    test_imgs_uint8 = []
-    for img_id in ids:
-        path = os.path.join(TEST_DIR, img_id)
-        img = keras.utils.load_img(path, target_size=IMG_SIZE)
-        test_imgs_uint8.append(keras.utils.img_to_array(img).astype(np.uint8))
-    x_test_uint8 = np.stack(test_imgs_uint8)
+    test_images_list = []
+    for image_id in test_ids:
+        full_path = os.path.join(TEST_DIR, image_id)
+        img = keras.utils.load_img(full_path, target_size=IMG_SIZE)
+        test_images_list.append(keras.utils.img_to_array(img).astype(np.uint8))
+    x_test_uint8 = np.stack(test_images_list)
 
-    skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
-    ensemble_probs = np.zeros((len(ids), num_classes), dtype=np.float32)
+    kfold_splitter = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
+    # Sum of probabilities from each fold; divide by N_FOLDS at the end
+    sum_of_probs = np.zeros((len(test_ids), num_classes), dtype=np.float32)
 
     for fold_idx, (train_idx, val_idx) in enumerate(
-        skf.split(np.arange(n_samples), labels)
+        kfold_splitter.split(np.arange(n_samples), labels)
     ):
         model = train_one_fold(
             fold_idx,
@@ -373,15 +323,15 @@ def main():
             num_classes=num_classes,
         )
         fold_probs = tta_predict_probs(model, x_test_uint8)
-        ensemble_probs += fold_probs.astype(np.float32)
+        sum_of_probs += fold_probs.astype(np.float32)
         keras.backend.clear_session()
 
-    ensemble_probs /= float(N_FOLDS)
-    pred_indices = np.argmax(ensemble_probs, axis=1)
-    pred_labels = [class_names[i] for i in pred_indices]
+    average_probs = sum_of_probs / float(N_FOLDS)
+    predicted_class_index = np.argmax(average_probs, axis=1)
+    predicted_labels = [class_names[i] for i in predicted_class_index]
 
-    out = pd.DataFrame({"id": ids, "label": pred_labels})
-    out.to_csv(SUBMISSION_PATH, index=False, quoting=1)
+    result_table = pd.DataFrame({"id": test_ids, "label": predicted_labels})
+    result_table.to_csv(SUBMISSION_PATH, index=False, quoting=1)
     print(f"\nSaved 5-fold ensemble predictions to {SUBMISSION_PATH}")
 
 
